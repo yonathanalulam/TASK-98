@@ -5,6 +5,50 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
+compose_style=""
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  compose_style="docker"
+elif command -v docker-compose >/dev/null 2>&1; then
+  compose_style="docker-compose"
+fi
+
+compose() {
+  if [[ "$compose_style" == "docker" ]]; then
+    docker compose "$@"
+    return $?
+  fi
+  docker-compose "$@"
+}
+
+have_compose() {
+  [[ -n "$compose_style" ]]
+}
+
+DEFAULT_LIVE_API_BASE="http://localhost:3001/api/v1"
+REQUESTED_API_BASE="${API_BASE_URL:-}"
+
+is_local_api_base() {
+  case "$1" in
+    *localhost*|*127.0.0.1*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [[ -z "$REQUESTED_API_BASE" ]]; then
+  LIVE_API_BASE="$DEFAULT_LIVE_API_BASE"
+elif is_local_api_base "$REQUESTED_API_BASE"; then
+  LIVE_API_BASE="${REQUESTED_API_BASE%/}"
+elif [[ "${RUN_TESTS_ALLOW_REMOTE_API:-0}" == "1" ]]; then
+  LIVE_API_BASE="${REQUESTED_API_BASE%/}"
+else
+  LIVE_API_BASE="$DEFAULT_LIVE_API_BASE"
+  echo "NOTICE: Ignoring non-local API_BASE_URL=$REQUESTED_API_BASE"
+  echo "        Using local Docker endpoint $LIVE_API_BASE (set RUN_TESTS_ALLOW_REMOTE_API=1 to override)."
+fi
+
+LIVE_API_BASE="${LIVE_API_BASE%/}"
+export API_BASE_URL="$LIVE_API_BASE"
+
 # Strict-mode behaviour: by default this runner is Docker-first. Unit tests run
 # inside the `app` container (built by docker-compose.yml), which already has
 # devDependencies installed at image build time. The local `npm ci` fallback
@@ -23,21 +67,30 @@ if [[ ! -f node_modules/jest/bin/jest.js ]] || [[ ! -f node_modules/ts-jest/pack
   need_node_modules=1
 fi
 
+RUN_NODE_TESTS_IN_DOCKER=0
+
 if [[ "$need_node_modules" == "1" ]]; then
-  if [[ "${RUN_TESTS_STRICT:-}" == "1" ]]; then
-    echo "ERROR: node_modules is missing and RUN_TESTS_STRICT=1 forbids host-side install."
-    echo "Run tests inside Docker: docker-compose up --build   (or)   docker compose run --rm app npm run test:unit"
-    exit 1
-  fi
-  if [[ "${RUN_TESTS_ALLOW_NPM_CI:-}" == "1" ]] && [[ "${RUN_TESTS_SKIP_NPM_CI:-}" != "1" ]]; then
-    echo "Unit tests require devDependencies — RUN_TESTS_ALLOW_NPM_CI=1 set; running npm ci in $(pwd) ..."
+  if [[ "${RUN_TESTS_ALLOW_NPM_CI:-}" == "1" ]] && [[ "${RUN_TESTS_SKIP_NPM_CI:-}" != "1" ]] && [[ "${RUN_TESTS_STRICT:-}" != "1" ]]; then
+    echo "Unit tests require devDependencies - RUN_TESTS_ALLOW_NPM_CI=1 set; running npm ci in $(pwd) ..."
     npm ci
   else
-    echo "NOTICE: node_modules is missing. Skipping host-side install (strict default)."
-    echo "       - To use Docker (preferred):  docker-compose up --build"
-    echo "       - To opt into a local install: RUN_TESTS_ALLOW_NPM_CI=1 bash run_tests.sh"
-    echo "       - Unit suite will be skipped for this run."
-    SKIP_UNIT_TESTS=1
+    if have_compose; then
+      RUN_NODE_TESTS_IN_DOCKER=1
+      echo "NOTICE: node_modules is missing. Running Node-based suites inside Docker app container."
+      echo "       - Host-side npm ci remains disabled by default."
+      echo "       - To opt into local install: RUN_TESTS_ALLOW_NPM_CI=1 bash run_tests.sh"
+    else
+      if [[ "${RUN_TESTS_STRICT:-}" == "1" ]]; then
+        echo "ERROR: node_modules is missing, strict mode forbids host npm ci, and docker compose is unavailable."
+        echo "Install Docker (recommended) or provide node_modules before running strict mode."
+        exit 1
+      fi
+      echo "NOTICE: node_modules is missing. Skipping host-side install (strict default)."
+      echo "       - To use Docker (preferred):  docker compose up --build"
+      echo "       - To opt into a local install: RUN_TESTS_ALLOW_NPM_CI=1 bash run_tests.sh"
+      echo "       - Unit suite will be skipped for this run."
+      SKIP_UNIT_TESTS=1
+    fi
   fi
 fi
 
@@ -75,14 +128,86 @@ echo "- Dev-only soft-skip: SKIP_LIVE_TESTS=1 runs unit only (not permitted in s
 echo "- Strict mode: RUN_TESTS_STRICT=1 refuses host-side npm ci AND refuses SKIP_LIVE_TESTS"
 echo "- Auto-start: if API is down and RUN_TESTS_AUTOSTART_DOCKER!=0 the runner brings the stack up and waits for /health"
 
+health_http_code() {
+  curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 12 "${LIVE_API_BASE}/health" 2>/dev/null || printf '%s' '000'
+}
+
+api_health_ok() {
+  [[ "$(health_http_code)" == "200" ]]
+}
+
+should_autostart_docker() {
+  [[ "${RUN_TESTS_AUTOSTART_DOCKER:-1}" == "1" ]] || return 1
+  is_local_api_base "$LIVE_API_BASE" || return 1
+  have_compose || return 1
+  return 0
+}
+
+compose_up_detached() {
+  if [[ "${RUN_TESTS_DOCKER_BUILD:-1}" == "1" ]]; then
+    compose up -d --build
+    return $?
+  fi
+  compose up -d
+}
+
+ensure_live_api_ready() {
+  if api_health_ok; then
+    return 0
+  fi
+
+  if ! should_autostart_docker; then
+    echo ""
+    echo "ERROR: API is not reachable at $LIVE_API_BASE (health not HTTP 200)."
+    echo "From this directory run: docker compose up -d --build"
+    echo "Or set SKIP_LIVE_TESTS=1 to run unit tests only (dev mode)."
+    return 1
+  fi
+
+  echo ""
+  echo "=== API not reachable at $LIVE_API_BASE - starting Docker Compose ==="
+  if ! compose_up_detached; then
+    echo "ERROR: docker compose up -d failed. Start Docker Desktop (or the engine), then retry."
+    return 1
+  fi
+  echo "Waiting for GET $LIVE_API_BASE/health (up to ~4 minutes for image build/migrations on first run)..."
+  waited=0
+  max_wait_seconds=240
+  while [[ "$waited" -lt "$max_wait_seconds" ]]; do
+    if api_health_ok; then
+      echo "API is healthy."
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+    if [[ $((waited % 20)) -eq 0 ]]; then
+      echo "  ... still waiting (${waited}s / ${max_wait_seconds}s)"
+    fi
+  done
+
+  echo "ERROR: API still not healthy. Try: docker compose logs -f app"
+  echo "First-time builds can take several minutes; run bash run_tests.sh again when the app container is up."
+  return 1
+}
+
+if [[ "$RUN_NODE_TESTS_IN_DOCKER" == "1" ]]; then
+  if ! ensure_live_api_ready; then
+    exit 1
+  fi
+fi
+
 if [[ "${SKIP_UNIT_TESTS:-}" == "1" ]]; then
   if [[ "${RUN_TESTS_STRICT:-}" == "1" ]]; then
     echo "ERROR: Unit suite skipped (node_modules missing) under RUN_TESTS_STRICT=1."
     exit 1
   fi
-  echo "[SKIP] Unit tests — node_modules missing and strict mode refuses host-side install"
+  echo "[SKIP] Unit tests - node_modules missing and strict mode refuses host-side install"
 else
-  run_suite "Unit tests" "npm run test:unit"
+  if [[ "$RUN_NODE_TESTS_IN_DOCKER" == "1" ]]; then
+    run_suite "Unit tests" "compose exec -T app npm run test:unit"
+  else
+    run_suite "Unit tests" "npm run test:unit"
+  fi
 fi
 
 if [[ "${SKIP_LIVE_TESTS:-}" == "1" ]]; then
@@ -97,67 +222,17 @@ if [[ "${SKIP_LIVE_TESTS:-}" == "1" ]]; then
   echo "[SKIP] API tests"
   echo "[SKIP] Performance check"
 else
-  LIVE_API_BASE="${API_BASE_URL:-http://localhost:3001/api/v1}"
-  LIVE_API_BASE="${LIVE_API_BASE%/}"
-
-  health_http_code() {
-    curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 12 "${LIVE_API_BASE}/health" 2>/dev/null || printf '%s' '000'
-  }
-
-  api_health_ok() {
-    [[ "$(health_http_code)" == "200" ]]
-  }
-
-  should_autostart_docker() {
-    [[ "${RUN_TESTS_AUTOSTART_DOCKER:-1}" == "1" ]] || return 1
-    case "$LIVE_API_BASE" in
-      *localhost*|*127.0.0.1*) ;;
-      *) return 1 ;;
-    esac
-    command -v docker >/dev/null 2>&1 || return 1
-    docker compose version >/dev/null 2>&1 || return 1
-    return 0
-  }
-
-  if ! api_health_ok; then
-    if should_autostart_docker; then
-      echo ""
-      echo "=== API not reachable at $LIVE_API_BASE — starting Docker Compose ==="
-      if ! docker compose up -d; then
-        echo "ERROR: docker compose up -d failed. Start Docker Desktop (or the engine), then retry."
-        exit 1
-      fi
-      echo "Waiting for GET $LIVE_API_BASE/health (up to ~4 minutes for image build/migrations on first run)..."
-      waited=0
-      max_wait=120
-      while [[ "$waited" -lt "$max_wait" ]]; do
-        if api_health_ok; then
-          echo "API is healthy."
-          break
-        fi
-        sleep 2
-        waited=$((waited + 1))
-        if [[ $((waited % 10)) -eq 0 ]]; then
-          echo "  ... still waiting (${waited}s / $((max_wait * 2))s)"
-        fi
-      done
-      if ! api_health_ok; then
-        echo "ERROR: API still not healthy. Try: docker compose logs -f app"
-        echo "First-time builds can take several minutes; run bash run_tests.sh again when the app container is up."
-        exit 1
-      fi
-    else
-      echo ""
-      echo "ERROR: API is not reachable at $LIVE_API_BASE (health not HTTP 200)."
-      echo "From this directory run: docker compose up -d"
-      echo "Or set SKIP_LIVE_TESTS=1 to run unit tests only (dev mode)."
-      exit 1
-    fi
+  if ! ensure_live_api_ready; then
+    exit 1
   fi
 
-  run_suite "Integration tests" "npm run test:integration"
-  run_suite "API tests" "npm run test:api"
-  run_suite "Performance check" "npm run test:perf"
+  if [[ "$RUN_NODE_TESTS_IN_DOCKER" == "1" ]]; then
+    run_suite "Integration tests" "compose exec -T -e API_BASE_URL=http://localhost:3000/api/v1 app npm run test:integration"
+  else
+    run_suite "Integration tests" "API_BASE_URL=\"$LIVE_API_BASE\" npm run test:integration"
+  fi
+  run_suite "API tests" "API_BASE_URL=\"$LIVE_API_BASE\" npm run test:api"
+  run_suite "Performance check" "API_BASE_URL=\"$LIVE_API_BASE\" npm run test:perf"
 fi
 
 echo ""

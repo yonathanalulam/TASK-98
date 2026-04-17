@@ -23,6 +23,8 @@
  *   - tests/unit_tests/workflow-reminder.service.spec.ts         (mocked schedule clock)
  */
 
+export {};
+
 type JsonValue = unknown;
 type HttpResponse = { status: number; body: JsonValue; rawText: string };
 
